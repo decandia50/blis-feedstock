@@ -10,8 +10,9 @@ source:
   sha256: 7e345d666799e15bba570bd125f97042f17bf752a61dcf314486a6cd096d5f68
   patches:
     # upstreamed already (commit 787adad73b); can be dropped on next release
+    # upstreamed already (commit 2a0682f); can be dropped on next release
     - patches/xerbla.patch
-    - patches/issue451.patch
+    - patches/1647-Implemented-runtime-subconfig-selection-451.patch
 
 build:
   number: 2

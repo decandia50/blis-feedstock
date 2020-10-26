@@ -1,0 +1,595 @@
+From 2a0682f8e5998be536da313525292f0da6193147 Mon Sep 17 00:00:00 2001
+From: "Field G. Van Zee" <field@cs.utexas.edu>
+Date: Sun, 18 Oct 2020 18:04:03 -0500
+Subject: [PATCH 1647/1647] Implemented runtime subconfig selection (#451).
+
+Details:
+- Implemented support for the user manually overriding the automatic
+  subconfiguration selection that happens at runtime. This override
+  can be requested by setting the BLIS_ARCH_TYPE environment variable.
+  The variable must be set to the arch_t id (as enumerated in
+  bli_type_defs.h) corresponding to the desired subconfiguration. If a
+  value outside this enumerated range is given, BLIS will abort with an
+  error message. If the value is in the valid range but corresponds to a
+  subconfiguration that was not activated at configure-time/compile-time,
+  BLIS will abort with a (different) error message. Thanks to decandia50
+  for suggesting this feature via issue #451.
+- Defined a new function bli_gks_lookup_id to return the address of an
+  internal data structure within the gks. If this address is NULL, then
+  it indicates that the subconfig corresponding to the arch_t id passed
+  into the function was not compiled into BLIS. This function is used
+  in the second of the two abort scenarios described above.
+- Defined the enumerated error code BLIS_UNINITIALIZED_GKS_CNTX, which
+  is returned for the latter of the two abort scenarios mentioned above,
+  along with a corresponding error message and a function to perform
+  the error check.
+- Added cpp macro branching to bli_env.c to support compilation of the
+  auto-detect.x executable during configure-time. This cpp branch is
+  similar to the cpp code already found in bli_arch.c and bli_cpuid.c.
+- Cleaned up the auto_detect() function to facilitate easier maintenance
+  going forward. Also added a convenient debug switch that outputs the
+  compilation command for the auto-detect.x executable and exits.
+---
+ CREDITS                       |   1 +
+ configure                     | 115 ++++++++++++------
+ frame/base/bli_arch.c         | 221 ++++++++++++++++++++--------------
+ frame/base/bli_check.c        |  10 ++
+ frame/base/bli_check.h        |   1 +
+ frame/base/bli_env.c          |  10 +-
+ frame/base/bli_error.c        |   1 +
+ frame/base/bli_gks.c          |  19 +++
+ frame/base/bli_gks.h          |   1 +
+ frame/include/bli_type_defs.h |   1 +
+ 10 files changed, 253 insertions(+), 127 deletions(-)
+
+diff --git a/CREDITS b/CREDITS
+index c9a4e1d2..4bd56bff 100644
+--- a/CREDITS
++++ b/CREDITS
+@@ -21,6 +21,7 @@ but many others have contributed code and feedback, including
+   Jed Brown                @jedbrown           (Argonne National Laboratory)
+   Robin Christ             @robinchrist
+   Mat Cross                @matcross           (NAG)
++                           @decandia50
+   Kay Dewhurst             @jkd2016            (Max Planck Institute, Halle, Germany)
+   Jeff Diamond                                 (Oracle)
+   Johannes Dieterich       @iotamudelta
+diff --git a/configure b/configure
+index 9efe3c96..9e546606 100755
+--- a/configure
++++ b/configure
+@@ -1000,7 +1000,7 @@ select_tool()
+ 
+ auto_detect()
+ {
+-	local cc cflags config_defines detected_config rval
++	local cc cflags config_defines detected_config rval cmd
+ 
+ 	# Use the same compiler that was found earlier.
+ 	cc="${found_cc}"
+@@ -1017,40 +1017,57 @@ auto_detect()
+ 		cflags=
+ 	fi
+ 
+-	# Locate our source files.
+-	bli_arch_c="bli_arch.c"
+-	bli_cpuid_c="bli_cpuid.c"
+-	main_c="config_detect.c"
++	# Accumulate a list of source files we'll need to compile along with
++	# the top-level (root) directory in which they are located.
++	c_src_pairs=""
++	c_src_pairs="${c_src_pairs} frame:bli_arch.c"
++	c_src_pairs="${c_src_pairs} frame:bli_cpuid.c"
++	c_src_pairs="${c_src_pairs} frame:bli_env.c"
++	c_src_pairs="${c_src_pairs} build:config_detect.c"
+ 
+-	bli_arch_c_filepath=$(find ${dist_path}/frame -name "${bli_arch_c}")
+-	bli_cpuid_c_filepath=$(find ${dist_path}/frame -name "${bli_cpuid_c}")
+-	main_c_filepath=$(find ${dist_path}/build -name "${main_c}")
+-
+-	# Locate headers needed directly by the above files.
+-	bli_arch_h="bli_arch.h"
+-	bli_cpuid_h="bli_cpuid.h"
+-	bli_typed_h="bli_type_defs.h"
++	# Accumulate a list of full filepaths to the source files listed above.
++	c_src_filepaths=""
++	for pair in ${c_src_pairs}; do
+ 
+-	bli_arch_h_filepath=$(find ${dist_path}/frame -name "${bli_arch_h}")
+-	bli_cpuid_h_filepath=$(find ${dist_path}/frame -name "${bli_cpuid_h}")
+-	bli_typed_h_filepath=$(find ${dist_path}/frame -name "${bli_typed_h}")
++		filename=${pair#*:}
++		rootdir=${pair%:*}
+ 
+-	bli_arch_h_path=${bli_arch_h_filepath%/${bli_arch_h}}
+-	bli_cpuid_h_path=${bli_cpuid_h_filepath%/${bli_cpuid_h}}
+-	bli_typed_h_path=${bli_typed_h_filepath%/${bli_typed_h}}
++		filepath=$(find ${dist_path}/${rootdir} -name "${filename}")
++		c_src_filepaths="${c_src_filepaths} ${filepath}"
++	done
+ 
+-	# Locate other headers needed by bli_type_defs.h.
+-	bli_pthread_h="bli_pthread.h"
+-	bli_pthread_h_filepath=$(find ${dist_path}/frame -name "${bli_pthread_h}")
+-	bli_pthread_h_path=${bli_pthread_h_filepath%/${bli_pthread_h}}
+-	bli_malloc_h="bli_malloc.h"
+-	bli_malloc_h_filepath=$(find ${dist_path}/frame -name "${bli_malloc_h}")
+-	bli_malloc_h_path=${bli_malloc_h_filepath%/${bli_malloc_h}}
++	# Accumulate a list of header files we'll need to locate along with
++	# the top-level (root) directory in which they are located.
++	c_hdr_pairs=""
++	c_hdr_pairs="${c_hdr_pairs} frame:bli_system.h"
++	c_hdr_pairs="${c_hdr_pairs} frame:bli_type_defs.h"
++	c_hdr_pairs="${c_hdr_pairs} frame:bli_arch.h"
++	c_hdr_pairs="${c_hdr_pairs} frame:bli_cpuid.h"
++	c_hdr_pairs="${c_hdr_pairs} frame:bli_env.h"
++	# NOTE: These headers are needed by bli_type_defs.h.
++	c_hdr_pairs="${c_hdr_pairs} frame:bli_malloc.h"
++	c_hdr_pairs="${c_hdr_pairs} frame:bli_pthread.h"
++
++	# Accumulate a list of full paths to the header files listed above.
++	# While we are at it, we include the "-I" compiler option to indicate
++	# adding the path to the list of directories to search when encountering
++	# #include directives.
++	c_hdr_paths=""
++	for pair in ${c_hdr_pairs}; do
++
++		filename=${pair#*:}
++		rootdir=${pair%:*}
++
++		filepath=$(find ${dist_path}/${rootdir} -name "${filename}")
++		path=${filepath%/*}
++		c_hdr_paths="${c_hdr_paths} -I${path}"
++	done
+ 
+ 	# Define the executable name.
+ 	autodetect_x="auto-detect.x"
+ 
+ 	# Create #defines for all of the BLIS_CONFIG_ macros in bli_cpuid.c.
++	bli_cpuid_c_filepath=$(find ${dist_path}/frame -name "bli_cpuid.c")
+ 	config_defines=$(grep BLIS_CONFIG_ ${bli_cpuid_c_filepath} \
+ 	                 | sed -e 's/#ifdef /-D/g')
+ 
+@@ -1065,20 +1082,29 @@ auto_detect()
+ 	# framework.
+ 	# NOTE: -D_GNU_SOURCE is needed to enable POSIX extensions to
+ 	# pthreads (i.e., barriers).
+-	${cc} ${config_defines} \
++
++	cmd="${cc} ${config_defines} \
+ 	      -DBLIS_CONFIGURETIME_CPUID \
+-	      -I${bli_cpuid_h_path} \
+-	      -I${bli_arch_h_path} \
+-	      -I${bli_typed_h_path} \
+-	      -I${bli_pthread_h_path} \
+-	      -I${bli_malloc_h_path} \
++	      ${c_hdr_paths} \
+ 	      -std=c99 -D_GNU_SOURCE \
+ 	      ${cflags} \
+-	      ${bli_arch_c_filepath} \
+-	      ${bli_cpuid_c_filepath} \
++	      ${c_src_filepaths} \
+ 	      ${ldflags} \
+-	      ${main_c_filepath} \
+-	   -o ${autodetect_x}
++	      -o ${autodetect_x}"
++
++	if [ "${debug_auto_detect}" == "no" ]; then
++
++		# Execute the compilation command.
++		eval ${cmd}
++
++	else
++
++		# Debugging stuff. Instead of executing ${cmd}, join the lines together
++		# with tr and trim excess whitespace via awk.
++		cmd=$(echo "${cmd}" | tr '\n' ' ' | awk '{$1=$1;print}')
++		echo "${cmd}"
++		return
++	fi
+ 
+ 	# Run the auto-detect program.
+ 	detected_config=$(./${autodetect_x})
+@@ -1995,6 +2021,13 @@ main()
+ 	# source distribution directory.
+ 	dummy_file='_blis_dir_detect.tmp'
+ 
++	# -- Debugging --
++
++	# A global flag to help debug the compilation command for the executable
++	# that configure builds on-the-fly to perform hardware auto-detection.
++	debug_auto_detect="no"
++
++
+ 
+ 	# -- Command line option/argument parsing ----------------------------------
+ 
+@@ -2441,7 +2474,15 @@ main()
+ 		# Call the auto_detect() function and save the returned string in
+ 		# config_name.
+ 		config_name=$(auto_detect)
+-		#config_name="generic"
++
++		# Debugging stuff. When confirming the behavior of auto_detect(),
++		# it is useful to output ${config_name}, which in theory could be
++		# set temoprarily to something other than the config_name, such as
++		# the compilation command.
++		if [ "${debug_auto_detect}" = "yes" ]; then
++			echo "auto-detect program compilation command: ${config_name}"
++			exit 1
++		fi
+ 
+ 		echo "${script_name}: hardware detection driver returned '${config_name}'."
+ 
+diff --git a/frame/base/bli_arch.c b/frame/base/bli_arch.c
+index 24164b6d..47ce17fc 100644
+--- a/frame/base/bli_arch.c
++++ b/frame/base/bli_arch.c
+@@ -33,15 +33,16 @@
+ 
+ */
+ 
+-#ifndef BLIS_CONFIGURETIME_CPUID
+-  #include "blis.h"
+-#else
++#ifdef BLIS_CONFIGURETIME_CPUID
+   #define BLIS_INLINE static
+   #define BLIS_EXPORT_BLIS
+   #include "bli_system.h"
+   #include "bli_type_defs.h"
+   #include "bli_arch.h"
+   #include "bli_cpuid.h"
++  #include "bli_env.h"
++#else
++  #include "blis.h"
+ #endif
+ 
+ // -----------------------------------------------------------------------------
+@@ -75,96 +76,138 @@ void bli_arch_set_id_once( void )
+ 
+ void bli_arch_set_id( void )
+ {
+-	// NOTE: Change this usage of getenv() to bli_env_get_var() after
+-	// merging #351.
+-	//bool do_logging = bli_env_get_var( "BLIS_ARCH_DEBUG", 0 );
+-	bool do_logging = getenv( "BLIS_ARCH_DEBUG" ) != NULL;
++	// Check the environment variable BLIS_ARCH_DEBUG to see if the user
++	// requested that we echo the result of the subconfiguration selection.
++	bool do_logging = bli_env_get_var( "BLIS_ARCH_DEBUG", 0 );
+ 	bli_arch_set_logging( do_logging );
+ 
+-	// Architecture families.
+-#if defined BLIS_FAMILY_INTEL64 || \
+-    defined BLIS_FAMILY_AMD64   || \
+-    defined BLIS_FAMILY_X86_64  || \
+-    defined BLIS_FAMILY_ARM64   || \
+-    defined BLIS_FAMILY_ARM32
+-	id = bli_cpuid_query_id();
+-#endif
+-
+-	// Intel microarchitectures.
+-#ifdef BLIS_FAMILY_SKX
+-	id = BLIS_ARCH_SKX;
+-#endif
+-#ifdef BLIS_FAMILY_KNL
+-	id = BLIS_ARCH_KNL;
+-#endif
+-#ifdef BLIS_FAMILY_KNC
+-	id = BLIS_ARCH_KNC;
+-#endif
+-#ifdef BLIS_FAMILY_HASWELL
+-	id = BLIS_ARCH_HASWELL;
+-#endif
+-#ifdef BLIS_FAMILY_SANDYBRIDGE
+-	id = BLIS_ARCH_SANDYBRIDGE;
+-#endif
+-#ifdef BLIS_FAMILY_PENRYN
+-	id = BLIS_ARCH_PENRYN;
+-#endif
+-
+-	// AMD microarchitectures.
+-#ifdef BLIS_FAMILY_ZEN2
+-	id = BLIS_ARCH_ZEN2;
+-#endif
+-#ifdef BLIS_FAMILY_ZEN
+-	id = BLIS_ARCH_ZEN;
+-#endif
+-#ifdef BLIS_FAMILY_EXCAVATOR
+-	id = BLIS_ARCH_EXCAVATOR;
+-#endif
+-#ifdef BLIS_FAMILY_STEAMROLLER
+-	id = BLIS_ARCH_STEAMROLLER;
+-#endif
+-#ifdef BLIS_FAMILY_PILEDRIVER
+-	id = BLIS_ARCH_PILEDRIVER;
+-#endif
+-#ifdef BLIS_FAMILY_BULLDOZER
+-	id = BLIS_ARCH_BULLDOZER;
+-#endif
+-
+-	// ARM microarchitectures.
+-#ifdef BLIS_FAMILY_THUNDERX2
+-	id = BLIS_ARCH_THUNDERX2;
+-#endif
+-#ifdef BLIS_FAMILY_CORTEXA57
+-	id = BLIS_ARCH_CORTEXA57;
+-#endif
+-#ifdef BLIS_FAMILY_CORTEXA53
+-	id = BLIS_ARCH_CORTEXA53;
+-#endif
+-#ifdef BLIS_FAMILY_CORTEXA15
+-	id = BLIS_ARCH_CORTEXA15;
+-#endif
+-#ifdef BLIS_FAMILY_CORTEXA9
+-	id = BLIS_ARCH_CORTEXA9;
+-#endif
+-
+-	// IBM microarchitectures.
+-#ifdef BLIS_FAMILY_POWER10
+-	id = BLIS_ARCH_POWER10;
+-#endif
+-#ifdef BLIS_FAMILY_POWER9
+-	id = BLIS_ARCH_POWER9;
+-#endif
+-#ifdef BLIS_FAMILY_POWER7
+-	id = BLIS_ARCH_POWER7;
+-#endif
+-#ifdef BLIS_FAMILY_BGQ
+-	id = BLIS_ARCH_BGQ;
+-#endif
++	// Check the environment variable BLIS_ARCH_TYPE to see if the user
++	// requested that we use a specific subconfiguration.
++	dim_t req_id = bli_env_get_var( "BLIS_ARCH_TYPE", -1 );
+ 
+-	// Generic microarchitecture.
+-#ifdef BLIS_FAMILY_GENERIC
+-	id = BLIS_ARCH_GENERIC;
++#ifndef BLIS_CONFIGURETIME_CPUID
++	if ( req_id != -1 )
++	{
++		// BLIS_ARCH_TYPE was set. Cautiously check whether its value is usable.
++
++		// If req_id was set to an invalid arch_t value (ie: outside the range
++		// [0,BLIS_NUM_ARCHS-1]), output an error message and abort.
++		if ( bli_error_checking_is_enabled() )
++		{
++			err_t e_val = bli_check_valid_arch_id( req_id );
++			bli_check_error_code( e_val );
++		}
++
++		// At this point, we know that req_id is in the valid range, but we
++		// don't yet know if it refers to a context that was actually
++		// initialized. Query the address of an internal context data structure
++		// corresponding to req_id. This pointer will be NULL if the associated
++		// subconfig is not available.
++		cntx_t** req_cntx = bli_gks_lookup_id( req_id );
++
++		// This function checks the context pointer and aborts with a useful
++		// error message if the pointer is found to be NULL.
++		if ( bli_error_checking_is_enabled() )
++		{
++			err_t e_val = bli_check_initialized_gks_cntx( req_cntx );
++			bli_check_error_code( e_val );
++		}
++
++		// Finally, we can be confident that req_id (1) is in range and (2)
++		// refers to a context that has been initialized.
++		id = req_id;
++	}
++	else
+ #endif
++	{
++		// BLIS_ARCH_TYPE was unset. Proceed with normal subconfiguration
++		// selection behavior.
++
++		// Architecture families.
++		#if defined BLIS_FAMILY_INTEL64 || \
++		    defined BLIS_FAMILY_AMD64   || \
++		    defined BLIS_FAMILY_X86_64  || \
++		    defined BLIS_FAMILY_ARM64   || \
++		    defined BLIS_FAMILY_ARM32
++		id = bli_cpuid_query_id();
++		#endif
++
++		// Intel microarchitectures.
++		#ifdef BLIS_FAMILY_SKX
++		id = BLIS_ARCH_SKX;
++		#endif
++		#ifdef BLIS_FAMILY_KNL
++		id = BLIS_ARCH_KNL;
++		#endif
++		#ifdef BLIS_FAMILY_KNC
++		id = BLIS_ARCH_KNC;
++		#endif
++		#ifdef BLIS_FAMILY_HASWELL
++		id = BLIS_ARCH_HASWELL;
++		#endif
++		#ifdef BLIS_FAMILY_SANDYBRIDGE
++		id = BLIS_ARCH_SANDYBRIDGE;
++		#endif
++		#ifdef BLIS_FAMILY_PENRYN
++		id = BLIS_ARCH_PENRYN;
++		#endif
++
++		// AMD microarchitectures.
++		#ifdef BLIS_FAMILY_ZEN2
++		id = BLIS_ARCH_ZEN2;
++		#endif
++		#ifdef BLIS_FAMILY_ZEN
++		id = BLIS_ARCH_ZEN;
++		#endif
++		#ifdef BLIS_FAMILY_EXCAVATOR
++		id = BLIS_ARCH_EXCAVATOR;
++		#endif
++		#ifdef BLIS_FAMILY_STEAMROLLER
++		id = BLIS_ARCH_STEAMROLLER;
++		#endif
++		#ifdef BLIS_FAMILY_PILEDRIVER
++		id = BLIS_ARCH_PILEDRIVER;
++		#endif
++		#ifdef BLIS_FAMILY_BULLDOZER
++		id = BLIS_ARCH_BULLDOZER;
++		#endif
++
++		// ARM microarchitectures.
++		#ifdef BLIS_FAMILY_THUNDERX2
++		id = BLIS_ARCH_THUNDERX2;
++		#endif
++		#ifdef BLIS_FAMILY_CORTEXA57
++		id = BLIS_ARCH_CORTEXA57;
++		#endif
++		#ifdef BLIS_FAMILY_CORTEXA53
++		id = BLIS_ARCH_CORTEXA53;
++		#endif
++		#ifdef BLIS_FAMILY_CORTEXA15
++		id = BLIS_ARCH_CORTEXA15;
++		#endif
++		#ifdef BLIS_FAMILY_CORTEXA9
++		id = BLIS_ARCH_CORTEXA9;
++		#endif
++
++		// IBM microarchitectures.
++		#ifdef BLIS_FAMILY_POWER10
++		id = BLIS_ARCH_POWER10;
++		#endif
++		#ifdef BLIS_FAMILY_POWER9
++		id = BLIS_ARCH_POWER9;
++		#endif
++		#ifdef BLIS_FAMILY_POWER7
++		id = BLIS_ARCH_POWER7;
++		#endif
++		#ifdef BLIS_FAMILY_BGQ
++		id = BLIS_ARCH_BGQ;
++		#endif
++
++		// Generic microarchitecture.
++		#ifdef BLIS_FAMILY_GENERIC
++		id = BLIS_ARCH_GENERIC;
++		#endif
++	}
+ 
+ 	if ( bli_arch_get_logging() )
+ 		fprintf( stderr, "libblis: selecting sub-configuration '%s'.\n",
+diff --git a/frame/base/bli_check.c b/frame/base/bli_check.c
+index 4c7f93cf..78d139e6 100644
+--- a/frame/base/bli_check.c
++++ b/frame/base/bli_check.c
+@@ -891,6 +891,16 @@ err_t bli_check_valid_arch_id( arch_t id )
+ 	return e_val;
+ }
+ 
++err_t bli_check_initialized_gks_cntx( cntx_t** cntx )
++{
++	err_t e_val = BLIS_SUCCESS;
++
++	if ( cntx == NULL )
++		e_val = BLIS_UNINITIALIZED_GKS_CNTX;
++
++	return e_val;
++}
++
+ // -- Architecture-related errors ----------------------------------------------
+ 
+ err_t bli_check_valid_mc_mod_mult( blksz_t* mc, blksz_t* mr )
+diff --git a/frame/base/bli_check.h b/frame/base/bli_check.h
+index 53945840..70ec2fd8 100644
+--- a/frame/base/bli_check.h
++++ b/frame/base/bli_check.h
+@@ -110,6 +110,7 @@ err_t bli_check_alignment_is_mult_of_ptr_size( size_t align_size );
+ err_t bli_check_object_alias_of( obj_t* a, obj_t* b );
+ 
+ err_t bli_check_valid_arch_id( arch_t id );
++err_t bli_check_initialized_gks_cntx( cntx_t** cntx );
+ 
+ err_t bli_check_valid_mc_mod_mult( blksz_t* mc, blksz_t* mr );
+ err_t bli_check_valid_nc_mod_mult( blksz_t* nc, blksz_t* nr );
+diff --git a/frame/base/bli_env.c b/frame/base/bli_env.c
+index fafb38e8..cad272c8 100644
+--- a/frame/base/bli_env.c
++++ b/frame/base/bli_env.c
+@@ -33,7 +33,15 @@
+ 
+ */
+ 
+-#include "blis.h"
++#ifdef BLIS_CONFIGURETIME_CPUID
++  #define BLIS_INLINE static
++  #define BLIS_EXPORT_BLIS
++  #include "bli_system.h"
++  #include "bli_type_defs.h"
++  #include "bli_env.h"
++#else
++  #include "blis.h"
++#endif
+ 
+ // -----------------------------------------------------------------------------
+ 
+diff --git a/frame/base/bli_error.c b/frame/base/bli_error.c
+index 1199a2c9..1381afef 100644
+--- a/frame/base/bli_error.c
++++ b/frame/base/bli_error.c
+@@ -104,6 +104,7 @@ static char bli_error_string[BLIS_MAX_NUM_ERR_MSGS][BLIS_MAX_ERR_MSG_LENGTH] =
+ 	[-BLIS_EXPECTED_OBJECT_ALIAS]                = "Expected object to be alias.",
+ 
+ 	[-BLIS_INVALID_ARCH_ID]                      = "Invalid architecture id value.",
++	[-BLIS_UNINITIALIZED_GKS_CNTX]               = "Accessed uninitialized context in gks; BLIS_ARCH_TYPE is probably set to an invalid architecture id.",
+ 
+ 	[-BLIS_MC_DEF_NONMULTIPLE_OF_MR]             = "Default MC is non-multiple of MR for one or more datatypes.",
+ 	[-BLIS_MC_MAX_NONMULTIPLE_OF_MR]             = "Maximum MC is non-multiple of MR for one or more datatypes.",
+diff --git a/frame/base/bli_gks.c b/frame/base/bli_gks.c
+index e7543360..c789ec20 100644
+--- a/frame/base/bli_gks.c
++++ b/frame/base/bli_gks.c
+@@ -300,6 +300,25 @@ cntx_t* bli_gks_lookup_ind_cntx
+ 
+ // -----------------------------------------------------------------------------
+ 
++cntx_t** bli_gks_lookup_id
++     (
++       arch_t id
++     )
++{
++	// Return the address of the array of context pointers for a given
++	// architecture id. This function is only used for sanity check purposes
++	// to ensure that the underlying data structures for a particular id are
++	// initialized.
++
++	// Index into the array of context pointers for the given architecture id.
++	cntx_t** restrict gks_id = gks[ id ];
++
++	// Return the context pointer at gks_id_ind.
++	return gks_id;
++}
++
++// -----------------------------------------------------------------------------
++
+ void bli_gks_register_cntx
+      (
+        arch_t  id,
+diff --git a/frame/base/bli_gks.h b/frame/base/bli_gks.h
+index ad42a49c..188dcd50 100644
+--- a/frame/base/bli_gks.h
++++ b/frame/base/bli_gks.h
+@@ -42,6 +42,7 @@ void    bli_gks_init_index( void );
+ 
+ cntx_t* bli_gks_lookup_nat_cntx( arch_t id );
+ cntx_t* bli_gks_lookup_ind_cntx( arch_t id, ind_t ind );
++cntx_t** bli_gks_lookup_id( arch_t id );
+ void    bli_gks_register_cntx( arch_t id, void_fp nat_fp, void_fp ref_fp, void_fp ind_fp );
+ 
+ BLIS_EXPORT_BLIS cntx_t* bli_gks_query_cntx( void );
+diff --git a/frame/include/bli_type_defs.h b/frame/include/bli_type_defs.h
+index 050e0bf4..d92c35cb 100644
+--- a/frame/include/bli_type_defs.h
++++ b/frame/include/bli_type_defs.h
+@@ -1571,6 +1571,7 @@ typedef enum
+ 
+ 	// Architecture-related errors
+ 	BLIS_INVALID_ARCH_ID                       = (-150),
++	BLIS_UNINITIALIZED_GKS_CNTX                = (-151),
+ 
+ 	// Blocksize-related errors
+ 	BLIS_MC_DEF_NONMULTIPLE_OF_MR              = (-160),
+-- 
+2.23.3
+
